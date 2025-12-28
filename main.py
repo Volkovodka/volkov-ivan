@@ -1,295 +1,239 @@
 import pandas as pd
 import numpy as np
-import re
-import gc
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.multioutput import MultiOutputRegressor
 import warnings
-import random
-import os
-from tqdm.auto import tqdm
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.decomposition import TruncatedSVD
-from sklearn.model_selection import GroupKFold
-import lightgbm as lgb
-from scipy import stats
-
 warnings.filterwarnings('ignore')
 
-SEED = 993
-np.random.seed(SEED)
-random.seed(SEED)
+# Загрузка данных
+train_df = pd.read_csv('data/train.csv')
+test_df = pd.read_csv('data/test.csv')
 
 
-def preprocess_text(text):
-    """Нормализация текста: нижний регистр, только слова/пробелы/дефисы"""
-    if pd.isna(text):
-        return ""
-    text = str(text).lower()
-    text = re.sub(r'[^\w\s\-+]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-
-def create_features(df):
-    """Создание расширенного набора признаков"""
-    features = pd.DataFrame(index=df.index)
-
-    def compute_text_overlap(row):
-        q_words = set(row['query_clean'].split())
-        t_words = set(row['title_clean'].split())
-        if not q_words or not t_words:
-            return 0.0, 0.0, 0.0
-        intersection = q_words & t_words
-        union = q_words | t_words
-        jaccard = len(intersection) / len(union) if union else 0.0
-        overlap = len(intersection) / len(q_words) if q_words else 0.0
-        coverage = sum(1 for w in q_words if w in t_words) / len(q_words) if q_words else 0.0
-        return jaccard, overlap, coverage
-
-    results = df.apply(compute_text_overlap, axis=1, result_type='expand')
-    features['jaccard'] = results[0]
-    features['word_overlap'] = results[1]
-    features['coverage'] = results[2]
-
-    features['exact_match'] = df.apply(
-        lambda x: 1.0 if x['query_clean'] in x['title_clean'] else 0.0, axis=1
-    )
-    features['starts_with_query'] = df.apply(
-        lambda x: 1.0 if x['title_clean'].startswith(x['query_clean'][:15]) else 0.0, axis=1
-    )
-
-    features['query_len'] = df['query_clean'].str.len()
-    features['title_len'] = df['title_clean'].str.len()
-    features['desc_len'] = df['desc_clean'].str.len()
-
-    features['query_words'] = df['query_clean'].apply(lambda x: len(x.split()))
-    features['title_words'] = df['title_clean'].apply(lambda x: len(x.split()))
-
-    features['len_ratio'] = features['title_len'] / (features['query_len'] + 1)
-    features['word_ratio'] = features['title_words'] / (features['query_words'] + 1)
-
-    features['digits_in_title'] = df['title_clean'].apply(lambda x: 1.0 if any(c.isdigit() for c in x) else 0.0)
-    features['digits_in_query'] = df['query_clean'].apply(lambda x: 1.0 if any(c.isdigit() for c in x) else 0.0)
-
-    # Категориальные признаки
-    for col in ['product_brand', 'product_color', 'product_locale']:
-        if col in df.columns:
-            le = LabelEncoder()
-            features[f'{col}_enc'] = le.fit_transform(df[col].astype(str))
-
-    features['query_pos_in_title'] = df.apply(
-        lambda x: x['title_clean'].find(x['query_clean'][:10]) / max(len(x['title_clean']), 1), axis=1
-    )
-
-    features['composite_score'] = (
-        features['exact_match'] * 0.5 +
-        features['word_overlap'] * 0.3 +
-        features['coverage'] * 0.2
-    )
-
-    return features
-
-
-def create_submission(predictions, test_df):
-    """Создаёт submission файл в формате: id,prediction"""
-    test_df = test_df.copy()
-    if 'id' not in test_df.columns:
-        test_df['id'] = range(len(test_df))
+# Функция для создания признаков
+def create_features(df, is_train=True):
+    df = df.copy()
     
-    submission = pd.DataFrame({
-        'id': test_df['id'].values,
-        'prediction': predictions
-    }).drop_duplicates(subset=['id']).reset_index(drop=True)
+    # Преобразование даты
+    df['dt'] = pd.to_datetime(df['dt'])
+    df['year'] = df['dt'].dt.year
+    df['quarter'] = df['dt'].dt.quarter
+    df['week'] = df['dt'].dt.isocalendar().week
+    df['day'] = df['dt'].dt.day
+    df['dayofweek'] = df['dt'].dt.dayofweek
+    df['dayofyear'] = df['dt'].dt.dayofyear
+    df['is_month_start'] = df['dt'].dt.is_month_start.astype(int)
+    df['is_month_end'] = df['dt'].dt.is_month_end.astype(int)
+    df['is_quarter_start'] = df['dt'].dt.is_quarter_start.astype(int)
+    df['is_quarter_end'] = df['dt'].dt.is_quarter_end.astype(int)
+    
+    # Взаимодействие категориальных признаков
+    df['cat_interaction_1'] = df['management_group_id'].astype(str) + '_' + df['first_category_id'].astype(str)
+    df['cat_interaction_2'] = df['second_category_id'].astype(str) + '_' + df['third_category_id'].astype(str)
+    
+    # Сезонные признаки
+    df['sin_month'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['cos_month'] = np.cos(2 * np.pi * df['month'] / 12)
+    df['sin_day'] = np.sin(2 * np.pi * df['day_of_month'] / 31)
+    df['cos_day'] = np.cos(2 * np.pi * df['day_of_month'] / 31)
+    
+    # Признаки на основе погоды
+    df['temp_humidity_interaction'] = df['avg_temperature'] * df['avg_humidity']
+    df['wind_precipitation_interaction'] = df['avg_wind_level'] * df['precpt']
+    df['weather_severity'] = np.abs(df['avg_temperature']) + np.abs(df['avg_humidity']) + np.abs(df['avg_wind_level'])
+    
+    # Статистики по ценам
+    if 'price_p05' in df.columns and 'price_p95' in df.columns:
+        df['price_range'] = df['price_p95'] - df['price_p05']
+        df['price_mid'] = (df['price_p05'] + df['price_p95']) / 2
+    
+    return df
 
-    os.makedirs('results', exist_ok=True)
-    path = 'results/submission.csv'
-    submission.to_csv(path, index=False)
-    print(f"✓ Submission сохранён: {path}")
-    return path
+# Создаем признаки для train
+print("Создание признаков для train...")
+train_features = create_features(train_df, is_train=True)
 
+# Создаем признаки для test
+print("Создание признаков для test...")
+test_features = create_features(test_df, is_train=False)
 
-def main():
-    print("=" * 70)
-    print("РЕШЕНИЕ ДЛЯ СОРТИРОВКИ ПРОДУКТОВ ПО ЗАПРОСАМ")
-    print("=" * 70)
+# Кластеризация товаров для создания новых признаков
+print("Кластеризация товаров...")
+product_features = train_features.groupby('product_id').agg({
+    'price_p05': ['mean', 'std'],
+    'price_p95': ['mean', 'std'],
+    'n_stores': ['mean', 'std'],
+    'management_group_id': 'first',
+    'first_category_id': 'first'
+}).fillna(0)
 
-    # === ШАГ 1: ЗАГРУЗКА ДАННЫХ ===
-    train_df = pd.read_csv('data/train.csv')
-    test_df = pd.read_csv('data/test.csv')
-    print(f"\n[1/8] Данные загружены: train={train_df.shape}, test={test_df.shape}")
+product_features.columns = [f'product_{a}_{b}' if b != 'first' else f'product_{a}' 
+                           for a, b in product_features.columns]
 
-    # === ШАГ 2: ТЕКСТОВАЯ ПОДГОТОВКА ===
-    for df in [train_df, test_df]:
-        df['query_clean'] = df['query'].fillna('').apply(preprocess_text)
-        df['title_clean'] = df['product_title'].fillna('').apply(preprocess_text)
-        df['desc_clean'] = df['product_description'].fillna('').apply(preprocess_text)
-        for col in ['product_brand', 'product_color', 'product_locale']:
-            if col in df.columns:
-                df[col] = df[col].fillna('missing').astype(str)
-    print("[2/8] Текст обработан")
+# Стандартизация для кластеризации
+scaler_pca = StandardScaler()
+product_scaled = scaler_pca.fit_transform(product_features.select_dtypes(include=[np.number]))
 
-    # === ШАГ 3: БАЗОВЫЕ ПРИЗНАКИ ===
-    X_train = create_features(train_df)
-    X_test = create_features(test_df)
-    print("[3/8] Базовые признаки созданы")
+# Применяем PCA для снижения размерности
+print("Применение PCA...")
+pca = PCA(n_components=min(5, product_scaled.shape[1]), random_state=322)
+product_pca = pca.fit_transform(product_scaled)
 
-    # === ШАГ 4: TF-IDF + SVD ===
-    all_texts = pd.concat([
-        train_df['query_clean'] + ' _sep_ ' + train_df['title_clean'],
-        test_df['query_clean'] + ' _sep_ ' + test_df['title_clean']
-    ])
-    vectorizer = TfidfVectorizer(max_features=150, ngram_range=(1, 3), min_df=2, max_df=0.9, dtype=np.float32)
-    vectorizer.fit(all_texts)
+# Кластеризация на основе PCA компонент
+kmeans = KMeans(n_clusters=min(8, len(product_pca)), random_state=322, n_init=10)
+product_clusters = kmeans.fit_predict(product_pca)
+product_features['product_cluster'] = product_clusters
 
-    tfidf_train = vectorizer.transform(train_df['query_clean'] + ' _sep_ ' + train_df['title_clean'])
-    tfidf_test = vectorizer.transform(test_df['query_clean'] + ' _sep_ ' + test_df['title_clean'])
+# Добавляем кластеры к основным данным
+product_cluster_map = product_features['product_cluster'].to_dict()
+train_features['product_cluster'] = train_features['product_id'].map(product_cluster_map).fillna(-1).astype(int)
+test_features['product_cluster'] = test_features['product_id'].map(product_cluster_map).fillna(-1).astype(int)
 
-    svd = TruncatedSVD(n_components=25, random_state=SEED)
-    svd_train = svd.fit_transform(tfidf_train)
-    svd_test = svd.transform(tfidf_test)
+# Подготовка данных для обучения
+feature_columns = [
+    'n_stores', 'precpt', 'avg_temperature', 'avg_humidity', 'avg_wind_level',
+    'holiday_flag', 'activity_flag', 'management_group_id', 'first_category_id',
+    'second_category_id', 'third_category_id', 'dow', 'day_of_month', 
+    'week_of_year', 'month', 'year', 'quarter', 'week', 'day', 'dayofweek',
+    'dayofyear', 'is_month_start', 'is_month_end', 'is_quarter_start', 
+    'is_quarter_end', 'sin_month', 'cos_month', 'sin_day', 'cos_day',
+    'temp_humidity_interaction', 'wind_precipitation_interaction', 'weather_severity',
+    'product_cluster', 'cat_interaction_1', 'cat_interaction_2'
+]
 
-    for i in range(svd_train.shape[1]):
-        X_train[f'semantic_{i}'] = svd_train[:, i]
-        X_test[f'semantic_{i}'] = svd_test[:, i]
-    print("[4/8] TF-IDF + SVD признаки добавлены")
+# Преобразуем категориальные взаимодействия в числовые
+for df in [train_features, test_features]:
+    df['cat_interaction_1'] = df['cat_interaction_1'].astype('category').cat.codes
+    df['cat_interaction_2'] = df['cat_interaction_2'].astype('category').cat.codes
 
-    # === ШАГ 5: ГРУППОВЫЕ СТАТИСТИКИ ===
-    train_group_sizes = train_df.groupby('query_id').size()
-    test_group_sizes = test_df.groupby('query_id').size()
-    X_train['group_size'] = train_df['query_id'].map(train_group_sizes)
-    X_test['group_size'] = test_df['query_id'].map(test_group_sizes)
+# Удаляем строки с пропусками в целевых переменных
+train_features = train_features.dropna(subset=['price_p05', 'price_p95'])
 
-    numeric_cols = ['query_len', 'title_len', 'jaccard', 'word_overlap']
-    for col in numeric_cols:
-        if col in X_train.columns:
-            group_means = train_df.groupby('query_id').apply(lambda x: X_train.loc[x.index, col].mean())
-            X_train[f'group_mean_{col}'] = train_df['query_id'].map(group_means)
-            X_test[f'group_mean_{col}'] = X_test[col].mean()
-            X_train[f'group_dev_{col}'] = X_train[col] - X_train[f'group_mean_{col}']
-            X_test[f'group_dev_{col}'] = X_test[col] - X_test[f'group_mean_{col}']
-    print("[5/8] Групповые признаки добавлены")
+X = train_features[feature_columns].fillna(0)
+y = train_features[['price_p05', 'price_p95']]
 
-    # === ШАГ 6: ФИНАЛЬНАЯ ПОДГОТОВКА ===
-    X_train = X_train.fillna(0)
-    X_test = X_test.fillna(0)
+# Детекция аномалий с помощью Isolation Forest
+print("Детекция аномалий...")
+iso_forest = IsolationForest(contamination=0.05, random_state=322)
+outliers = iso_forest.fit_predict(X)
+X_clean = X[outliers == 1]
+y_clean = y.loc[X_clean.index]
 
-    # Стандартизация некатегориальных признаков
-    cat_cols = [col for col in X_train.columns if '_enc' in col]
-    num_cols = [col for col in X_train.columns if col not in cat_cols]
+print(f"Удалено аномалий: {len(X) - len(X_clean)}")
 
-    scaler = StandardScaler()
-    X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(X_train[num_cols]),
-        columns=num_cols, index=X_train.index
+# Обучение модели
+print("Обучение модели...")
+# Используем RobustScaler для устойчивости к выбросам
+robust_scaler = RobustScaler()
+X_scaled = robust_scaler.fit_transform(X_clean)
+
+# Градиентный бустинг с мульти-таргет регрессией
+model = MultiOutputRegressor(
+    GradientBoostingRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=5,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        random_state=322,
+        subsample=0.8
     )
-    X_test_scaled = pd.DataFrame(
-        scaler.transform(X_test[num_cols]),
-        columns=num_cols, index=X_test.index
+)
+
+model.fit(X_scaled, y_clean)
+print("Модель обучена!")
+
+# Подготовка тестовых данных
+print("Подготовка тестовых данных...")
+X_test = test_features[feature_columns].fillna(0)
+X_test_scaled = robust_scaler.transform(X_test)
+
+# Предсказание для теста
+print("Предсказание для теста...")
+predictions = model.predict(X_test_scaled)
+
+# Создание сабмишена
+submission = test_df.copy()
+submission = submission[['row_id']]
+submission['price_p05'] = predictions[:, 0]
+submission['price_p95'] = predictions[:, 1]
+
+# Пост-обработка: убедимся, что p05 <= p95
+submission['price_p05'] = np.minimum(submission['price_p05'], submission['price_p95'] - 0.001)
+submission['price_p95'] = np.maximum(submission['price_p95'], submission['price_p05'] + 0.001)
+
+# Сохранение результатов
+submission.to_csv('results/submission.csv', index=False)
+print("Сабмишн сохранен в submission.csv")
+
+# Валидация модели
+print("\nВалидация модели:")
+print("=" * 50)
+
+# Рассчитаем IoU на временном сплите
+from sklearn.model_selection import train_test_split
+
+# Разделим данные на train/val с учетом времени
+train_features_sorted = train_features.sort_values('dt')
+split_idx = int(len(train_features_sorted) * 0.8)
+X_train = train_features_sorted.iloc[:split_idx][feature_columns].fillna(0)
+y_train = train_features_sorted.iloc[:split_idx][['price_p05', 'price_p95']]
+X_val = train_features_sorted.iloc[split_idx:][feature_columns].fillna(0)
+y_val = train_features_sorted.iloc[split_idx:][['price_p05', 'price_p95']]
+
+# Обучим модель на train
+robust_scaler_val = RobustScaler()
+X_train_scaled = robust_scaler_val.fit_transform(X_train)
+model_val = MultiOutputRegressor(
+    GradientBoostingRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=5,
+        random_state=322
     )
+)
+model_val.fit(X_train_scaled, y_train)
 
-    # Объединяем обратно с категориальными
-    for col in cat_cols:
-        X_train_scaled[col] = X_train[col].values
-        X_test_scaled[col] = X_test[col].values
+# Предсказание на validation
+X_val_scaled = robust_scaler_val.transform(X_val)
+val_preds = model_val.predict(X_val_scaled)
 
-    X_train_final = X_train_scaled.astype('float32')
-    X_test_final = X_test_scaled.astype('float32')
+# Функция для расчета IoU
+def calculate_iou(true_p05, true_p95, pred_p05, pred_p95, epsilon=1e-6):
+    # "Утолщение" интервалов
+    true_p05 = true_p05 - epsilon
+    true_p95 = true_p95 + epsilon
+    pred_p05 = pred_p05 - epsilon
+    pred_p95 = pred_p95 + epsilon
+    
+    intersection = np.maximum(0, np.minimum(true_p95, pred_p95) - np.maximum(true_p05, pred_p05))
+    union = (true_p95 - true_p05) + (pred_p95 - pred_p05) - intersection
+    iou = intersection / (union + 1e-10)
+    return np.mean(iou)
 
-    y_train = train_df['relevance'].values
-    groups = train_df['query_id'].values
-    print(f"[6/8] Данные готовы: признаков={X_train_final.shape[1]}")
+iou_score = calculate_iou(y_val['price_p05'].values, y_val['price_p95'].values, 
+                          val_preds[:, 0], val_preds[:, 1])
+print(f"IoU score на валидации: {iou_score:.4f}")
 
-    # === ШАГ 7: ОБУЧЕНИЕ МОДЕЛИ ===
-    params = {
-        'objective': 'lambdarank',
-        'metric': 'ndcg',
-        'ndcg_eval_at': [10],
-        'boosting_type': 'gbdt',
-        'num_leaves': 127,
-        'max_depth': 8,
-        'learning_rate': 0.05,
-        'min_child_samples': 30,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'reg_alpha': 0.1,
-        'reg_lambda': 0.3,
-        'random_state': SEED,
-        'n_estimators': 500,
-        'verbosity': -1,
-        'n_jobs': -1,
-    }
+# Статистики предсказаний
+print("\nСтатистики предсказаний:")
+print(f"Min price_p05: {submission['price_p05'].min():.4f}")
+print(f"Max price_p95: {submission['price_p95'].max():.4f}")
+print(f"Mean price range: {(submission['price_p95'] - submission['price_p05']).mean():.4f}")
+print(f"Std price range: {(submission['price_p95'] - submission['price_p05']).std():.4f}")
 
-    gkf = GroupKFold(n_splits=5)
-    test_preds = np.zeros(len(X_test_final))
+# Анализ важности признаков
+print("\nАнализ важности признаков (первые 10):")
+feature_importance = pd.DataFrame({
+    'feature': feature_columns,
+    'importance': model.estimators_[0].feature_importances_
+})
+feature_importance = feature_importance.sort_values('importance', ascending=False)
+print(feature_importance.head(10))
 
-    for fold, (tr_idx, val_idx) in enumerate(gkf.split(X_train_final, y_train, groups), 1):
-        print(f"\n[7/8] Обучение фолда {fold}/{gkf.n_splits}")
-
-        X_tr, y_tr = X_train_final.iloc[tr_idx], y_train[tr_idx]
-        X_val, y_val = X_train_final.iloc[val_idx], y_train[val_idx]
-        g_tr, g_val = groups[tr_idx], groups[val_idx]
-
-        train_groups = [np.sum(g_tr == gid) for gid in np.unique(g_tr)]
-        val_groups = [np.sum(g_val == gid) for gid in np.unique(g_val)]
-
-        train_ds = lgb.Dataset(X_tr, label=y_tr, group=train_groups, free_raw_data=False)
-        val_ds = lgb.Dataset(X_val, label=y_val, group=val_groups, reference=train_ds, free_raw_data=False)
-
-        model = lgb.train(
-            params,
-            train_ds,
-            valid_sets=[val_ds],
-            num_boost_round=params['n_estimators'],
-            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)]
-        )
-
-        test_preds += model.predict(X_test_final) / gkf.n_splits
-        del model, train_ds, val_ds
-        gc.collect()
-
-    # === ШАГ 8: ПОСТОБРАБОТКА ===
-    final_preds = test_preds.copy()
-
-    print("\n[8/8] Постобработка: усиление топа...")
-    for query_id in tqdm(test_df['query_id'].unique()):
-        mask = test_df['query_id'] == query_id
-        idxs = np.where(mask)[0]
-        if len(idxs) <= 1:
-            continue
-        scores = final_preds[mask]
-        if scores.std() > 0:
-            scores = (scores - scores.mean()) / scores.std()
-        exp_scores = np.exp(scores - np.max(scores))
-        softmax = exp_scores / exp_scores.sum()
-        final_preds[mask] = 0.6 * scores + 0.4 * softmax
-
-        top_k = min(3, len(scores))
-        top_idx = np.argsort(final_preds[mask])[-top_k:]
-        for i, idx in enumerate(top_idx):
-            boost = 1.0 + (i + 1) * 0.05
-            orig_idx = idxs[idx]
-            final_preds[orig_idx] *= boost
-
-    print("Постобработка: ранжирование...")
-    for query_id in tqdm(test_df['query_id'].unique()):
-        mask = test_df['query_id'] == query_id
-        group_scores = final_preds[mask]
-        if len(group_scores) > 1:
-            ranks = stats.rankdata(group_scores, method='ordinal')
-            max_rank = len(group_scores)
-            norm_ranks = (max_rank - ranks + 1) / max_rank
-            final_preds[mask] = 0.5 * group_scores + 0.5 * norm_ranks
-
-    # Нормализация по всему тесту
-    final_preds = (final_preds - final_preds.mean()) / (final_preds.std() + 1e-8)
-
-    # Сохранение
-    create_submission(final_preds, test_df)
-
-    print("\n" + "=" * 60)
-    print("ГОТОВО!")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+print("\nГотово! Проверьте файл submission.csv")
