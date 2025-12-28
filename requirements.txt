@@ -1,9 +1,10 @@
-# Базовые пакеты для Data Science и ML
-# Укажите точные версии пакетов, которые вы используете в своем решении
-
+setuptools==69.5.1
 pandas==2.2.2
 numpy==1.26.4
 scikit-learn==1.4.2
 lightgbm==4.4.0
-tqdm==4.66.4
-scipy==1.13.1
+catboost==1.2.5
+matplotlib==3.8.4
+seaborn==0.13.2
+scipy==1.13.0
+joblib==1.4.2
